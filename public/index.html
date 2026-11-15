@@ -1078,6 +1078,7 @@ const STORE = "imds-auto-judgement-v1";
 let S = { records: [], answers: {}, partAnswers: {}, approvals: {}, audit: [], imports: [], flags: {}, settings: {} };
 try { const raw = localStorage.getItem(STORE); if (raw) S = Object.assign(S, JSON.parse(raw)); } catch (e) {}
 S.flags = S.flags || {}; S.settings = S.settings || {}; S.selfChecks = S.selfChecks || [];
+S.followUps = S.followUps || {}; S.resubmits = S.resubmits || {};
 /** WARP part-number auto-judgment rule. Editable in Settings; stored with the data. */
 const RULE_DEFAULTS = { warpAuto: true, warpRequireName: true, warpRequireEngineOk: true };
 function rule(k) { return S.settings[k] === undefined ? RULE_DEFAULTS[k] : S.settings[k]; }
@@ -1235,7 +1236,9 @@ function render() {
   $("#n-todo").textContent = open.length;
   { const rl = user().role, can = rl !== "Internal Reviewer"; $("#rolehint").textContent = can ? "✓ Can confirm final OK / NG" : "Recommend only · switch to Approver to confirm"; }
   const nSelf = $("#n-self"); if (nSelf) nSelf.textContent = selfCheckRows().length;
-  $("#n-sup").textContent = open.filter((i) => i.evaluation.routeTo === "Supplier").length;
+  // suppliers still to contact, plus parts still to be resubmitted
+  $("#n-sup").textContent = Object.keys(supplierOpen()).filter((k) => fuOf(k).status !== "REPLIED").length
+    + resubmitCases().filter((it) => (S.resubmits[it.key] || {}).status !== "RESUBMITTED").length;
   ({ overview: viewOverview, register: viewRegister, import: viewImport, history: viewHistory, supplier: viewSupplier, selfcheck: viewSelfCheck, refs: viewRefs, rules: viewRules })[UI.view]();
 }
 
@@ -1751,13 +1754,238 @@ function viewSelfCheck() {
   };
 }
 
+// ---------------- Supplier follow-up ----------------
+const supKey = (r) => `${r.supplierCode || "—"}|${r.companyName || ""}`;
+const FU_LABEL = { NEED: "Need follow-up", SENT: "Already followed up", REPLIED: "Supplier replied" };
+function fuOf(key) { return S.followUps[key] || { status: "NEED", round: 0, history: [] }; }
+function setFollowUp(key, status, note) {
+  const u = user(), prev = fuOf(key);
+  S.followUps[key] = { status, at: new Date().toISOString(), user: u.user, role: u.role, note: note || "",
+    round: status === "SENT" ? (prev.round || 0) + 1 : prev.round || 0,
+    history: [...(prev.history || []), { at: new Date().toISOString(), user: u.user, status, note: note || "" }].slice(-20) };
+  S.audit.push({ at: new Date().toISOString(), ...u, action: `FOLLOWUP_${status}`, part: key.split("|")[0], detail: `${FU_LABEL[status]}${note ? " — " + note : ""}` });
+  save(); render();
+}
+function setResubmit(key, status, note) {
+  const u = user();
+  if (status === null) delete S.resubmits[key];
+  else S.resubmits[key] = { status, at: new Date().toISOString(), user: u.user, note: note || "" };
+  S.audit.push({ at: new Date().toISOString(), ...u, action: status === "RESUBMITTED" ? "IMDS_RESUBMITTED" : "RESUBMIT_RESET", recordKey: key, detail: note || "" });
+  save(); render();
+}
+/** Cases where the engine is waiting on the supplier, grouped per supplier. */
+function supplierOpen() {
+  const by = {};
+  for (const it of ITEMS) {
+    if (finalOf(it)) continue;
+    const askingSupplier = it.evaluation.routeTo === "Supplier" || (flagOf(it) || {}).status === "NEED_SUPPLIER";
+    if (!askingSupplier) continue;
+    (by[supKey(it.record)] ||= []).push(it);
+  }
+  return by;
+}
+/** NG judgements mean the supplier has to resubmit the IMDS entry. */
+function resubmitCases() {
+  return ITEMS.filter((it) => { const f = finalOf(it); return f && f.newStatus === "FINAL_NG"; });
+}
+/** The e-mail address we already hold for a supplier, from their self-check sheet. */
+function supplierEmail(code) {
+  for (const sub of S.selfChecks || []) {
+    if (String(sub.supplierCode || "").trim() !== String(code || "").trim()) continue;
+    const c = (sub.contacts || []).find((x) => x.email);
+    if (c) return c.email;
+  }
+  return "";
+}
+const ordinal = (n) => ["", "1st", "2nd", "3rd"][n] || `${n}th`;
+
+/** One sentence describing the error, in the wording Material Engineering uses.
+ *  Falls back to the engine's own question when the category is not one of the known ones. */
+function errorSentence(cat, cases, q) {
+  const cas = [...new Set(cases.map((c) => c.record.cas).filter(Boolean))];
+  const casList = cas.join(", ");
+  const overLimit = cases.some((c) => c.record.contentPct != null && c.record.contentPct > 0.1);
+  if (/prohibited substance/i.test(cat) && cas.length) {
+    return `These part numbers contain substance with CAS No. ${casList} that is considered as potential prohibited substance ${overLimit ? "and more than 0.1wt%" : "and needs to be declared in IMDS"}. \nTherefore, please inform substance breakdown information and confirm whether:`;
+  }
+  if (/mass tolerance/i.test(cat)) {
+    return `For these part numbers, the mass information submitted in IMDS is outside the drawing mass tolerance range.\nTherefore, please inform the actual mass of the part number and confirm whether mass weight inputted in IMDS is:`;
+  }
+  if (/mass deviation/i.test(cat)) {
+    return `For these part numbers, the component mass and the total material mass submitted in IMDS do not agree.\nTherefore, please check the material breakdown and confirm whether:`;
+  }
+  if (/not specific substance/i.test(cat)) {
+    return `These part numbers contain substances declared as "not specific" above the allowed share.\nTherefore, please inform the substance breakdown and confirm whether:`;
+  }
+  if (/warp|area code|supplier code/i.test(cat)) {
+    return `For these part numbers, the registration details in IMDS do not match our records.\nTherefore, please confirm the correct information:`;
+  }
+  return `${q || "These part numbers need your confirmation."}\nTherefore, please confirm whether:`;
+}
+/** Build the follow-up e-mail from the supplier's actual open cases. */
+function followUpTemplate(key, cases) {
+  const [code, company] = key.split("|");
+  const pic = user().user === "unnamed" ? "[your name]" : user().user;
+  const title = S.settings.picTitle || "Material Engineering - TMMIN";
+  // group by error category + the exact question, so two different questions become two errors
+  const groups = new Map();
+  for (const it of cases) {
+    const q = it.evaluation.pendingQuestion;
+    const gk = `${it.evaluation.errorCategory}||${q ? q.question : (flagOf(it) || {}).comment || ""}`;
+    if (!groups.has(gk)) groups.set(gk, { cat: it.evaluation.errorCategory, q, cases: [] });
+    groups.get(gk).cases.push(it);
+  }
+  let body = `Good morning.\nThis is ${pic} from ${title} as IMDS PIC.\nHerewith, I would like to inform you that we've found error in your IMDS submission that needs your confirmation.\n`;
+  let n = 0;
+  for (const g of groups.values()) {
+    n++;
+    const parts = [...new Set(g.cases.map((c) => c.record.deliveryPartNo).filter(Boolean))];
+    body += `\nError ${n} : ${g.cat}\nPart Number :\n`;
+    parts.forEach((p, i) => { body += `   ${i + 1}. ${p}\n`; });
+    body += `\n${errorSentence(g.cat, g.cases, g.q && g.q.question)}\n`;
+    const opts = g.q && g.q.options ? g.q.options : [];
+    if (opts.length) opts.forEach((o) => { body += `${o.label}\n`; });
+    else body += `A. Input mistake (then we will judge NG, and you need to resubmit the correct information)\nB. Confirmed as submitted (then we will judge based on the confirmed information)\n`;
+  }
+  body += `\nWe look forward for your feedback.\nThank you for your support.\n\nBest Regards,\n${pic}\n${title}`;
+  const subject = `IMDS Submission - Confirmation Needed (${code}${company ? " " + company : ""}) - ${n} error${n === 1 ? "" : "s"}`;
+  return { subject, body, groups: n, parts: new Set(cases.map((c) => c.record.deliveryPartNo)).size };
+}
+/** Template listing the parts an NG supplier has to resubmit, with our reject comments. */
+function resubmitTemplate(key, cases) {
+  const [code, company] = key.split("|");
+  const pic = user().user === "unnamed" ? "[your name]" : user().user;
+  const title = S.settings.picTitle || "Material Engineering - TMMIN";
+  let body = `Good morning.\nThis is ${pic} from ${title} as IMDS PIC.\nHerewith, we inform you that the following IMDS submissions have been rejected and need to be resubmitted.\n`;
+  cases.forEach((it, i) => {
+    const f = finalOf(it) || {};
+    body += `\n${i + 1}. Part Number : ${it.record.deliveryPartNo || "—"}\n   Error : ${it.evaluation.errorCategory}\n`;
+    if (it.record.cas) body += `   CAS No. : ${it.record.cas}${it.record.substanceName ? " (" + it.record.substanceName + ")" : ""}\n`;
+    if (it.record.moduleId) body += `   Module ID / Version : ${it.record.moduleId} / ${it.record.moduleVersion || "—"}\n`;
+    body += `   Reject comment : ${f.imdsReject || f.comment || "—"}\n`;
+  });
+  body += `\nPlease correct the information above and resubmit the IMDS data.\nWe look forward for your feedback.\nThank you for your support.\n\nBest Regards,\n${pic}\n${title}`;
+  return { subject: `IMDS Resubmission Required (${code}${company ? " " + company : ""}) - ${cases.length} part${cases.length === 1 ? "" : "s"}`, body };
+}
+
 function viewSupplier() {
-  const rows = ITEMS.filter((i) => !finalOf(i) && i.evaluation.routeTo === "Supplier");
-  const bySup = {}; rows.forEach((i) => ((bySup[i.record.supplierCode + " " + (i.record.companyName || "")] ||= []).push(i)));
-  $("#main").innerHTML = header("SUPPLIER / FOLLOW-UP", "Supplier Follow-up", "Questions waiting for a supplier answer, grouped per supplier. Record the supplier's answer in the register.") +
-    (Object.keys(bySup).length ? Object.entries(bySup).map(([s, list]) => `<div class="card" style="margin-bottom:10px"><b>${esc(s)}</b> <span class="tag t-wait">${list.length} open</span>
-      <table style="margin-top:6px"><tbody>${list.map((i) => `<tr class="row" data-k="${esc(i.key)}"><td class="mono">${esc(i.record.deliveryPartNo)}</td><td>${esc(i.evaluation.errorCategory)}</td><td class="mono">${esc(i.record.cas || "")}</td><td>${esc(i.evaluation.pendingQuestion ? i.evaluation.pendingQuestion.question : i.evaluation.reasons[0])}</td></tr>`).join("")}</tbody></table></div>`).join("") : `<div class="card small">Nothing waiting for suppliers.</div>`);
+  const open = supplierOpen();
+  const resub = resubmitCases();
+  const resubBySup = {}; resub.forEach((it) => ((resubBySup[supKey(it.record)] ||= []).push(it)));
+  const tab = UI.fuTab || "open";
+  const keys = Object.keys(open).sort();
+  const need = keys.filter((k) => fuOf(k).status === "NEED").length;
+  const sent = keys.filter((k) => fuOf(k).status === "SENT").length;
+  const replied = keys.filter((k) => fuOf(k).status === "REPLIED").length;
+  const awaiting = resub.filter((it) => (S.resubmits[it.key] || {}).status !== "RESUBMITTED").length;
+  const done = resub.length - awaiting;
+  const pill = (k) => { const f = fuOf(k); return `<span class="tag ${f.status === "NEED" ? "t-wait" : f.status === "SENT" ? "t-route" : "t-ok"}">${f.status === "NEED" ? "⚠️ " : ""}${FU_LABEL[f.status]}${f.round ? ` · ${ordinal(f.round)}` : ""}</span>`; };
+
+  $("#main").innerHTML = header("SUPPLIER / FOLLOW-UP", "Supplier Follow-up",
+    "Everything waiting on a supplier: open questions with a ready-to-send e-mail, and parts rejected in IMDS that need resubmitting.") + `
+  <div class="kpis">
+    <button class="kpi y" data-fu="open"><span>⚠️ Need follow-up</span><b>${need}</b><em>supplier${need === 1 ? "" : "s"} not contacted yet</em></button>
+    <button class="kpi b" data-fu="open"><span>Already followed up</span><b>${sent}</b><em>waiting for their answer</em></button>
+    <button class="kpi g" data-fu="open"><span>Supplier replied</span><b>${replied}</b><em>answer recorded in the Workspace</em></button>
+    <button class="kpi r" data-fu="resubmit"><span>Awaiting IMDS resubmission</span><b>${awaiting}</b><em>${done} already resubmitted</em></button>
+  </div>
+  <div class="chips" style="margin:0 0 14px">
+    <button class="chip ${tab === "open" ? "on" : ""}" data-fu="open">Open questions<i>${keys.length}</i></button>
+    <button class="chip ${tab === "resubmit" ? "on" : ""}" data-fu="resubmit">Rejected — needs resubmission<i>${resub.length}</i></button>
+    <button class="chip ${tab === "settings" ? "on" : ""}" data-fu="settings">E-mail signature</button>
+  </div>` + (
+
+  tab === "settings" ? `
+  <div class="card w" style="max-width:640px"><h3>E-mail signature</h3>
+    <p class="hint">Used at the top and bottom of every generated follow-up. Your name comes from the sidebar.</p>
+    <label class="l">Your name (from the sidebar)</label><div class="mono">${esc(user().user === "unnamed" ? "— not set —" : user().user)}</div>
+    <label class="l">Division / title</label><input id="pic-title" class="btn" style="width:100%" value="${esc(S.settings.picTitle || "Material Engineering - TMMIN")}">
+    <button class="btn pri" id="pic-save" style="margin-top:10px">Save</button>
+  </div>`
+
+  : tab === "resubmit" ? (
+    resub.length ? Object.entries(resubBySup).sort().map(([key, list]) => {
+      const [code, company] = key.split("|");
+      const left = list.filter((it) => (S.resubmits[it.key] || {}).status !== "RESUBMITTED").length;
+      return `<div class="card w" style="margin-bottom:12px">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
+          <div><h3 style="margin:0">${esc(company || "—")}</h3><div class="small mono">${esc(code)}${supplierEmail(code) ? " · " + esc(supplierEmail(code)) : ""}</div></div>
+          <div><span class="tag ${left ? "t-ng" : "t-ok"}">${left ? `${left} awaiting resubmission` : "all resubmitted"}</span></div>
+        </div>
+        <table style="margin-top:12px"><thead><tr><th>Part number</th><th>Error</th><th>CAS / substance</th><th>Our reject comment</th><th>Status</th><th></th></tr></thead><tbody>
+        ${list.map((it) => { const f = finalOf(it) || {}, rs = S.resubmits[it.key] || {};
+          return `<tr><td class="mono"><button class="btn" data-goreg2="${esc(it.key)}" style="padding:2px 8px">${esc(it.record.deliveryPartNo || "—")}</button></td>
+          <td class="small">${esc(it.evaluation.errorCategory)}</td>
+          <td class="small mono">${esc(it.record.cas || "—")}<div class="small">${esc((it.record.substanceName || "").slice(0, 28))}</div></td>
+          <td class="small">${esc(f.imdsReject || f.comment || "—")}</td>
+          <td>${rs.status === "RESUBMITTED" ? `<span class="tag t-ok">Resubmitted</span><div class="small">${esc(rs.user || "")} · ${esc((rs.at || "").slice(0, 10))}</div>` : `<span class="tag t-ng">Awaiting</span>`}</td>
+          <td>${rs.status === "RESUBMITTED" ? `<button class="btn" data-unresub="${esc(it.key)}">Undo</button>` : `<button class="btn" data-resub="${esc(it.key)}">Mark resubmitted</button>`}</td></tr>`; }).join("")}
+        </tbody></table>
+        <div class="tools" style="margin-top:12px"><button class="btn pri" data-rmail="${esc(key)}">✉ Open resubmission e-mail</button><button class="btn" data-rcopy="${esc(key)}">Copy text</button></div>
+        <div id="rbox-${esc(key.replace(/[^a-z0-9]/gi, ""))}"></div>
+      </div>`; }).join("")
+    : `<div class="card empty"><div class="big">${ICO.inn}</div><h3>Nothing rejected</h3><p>Parts judged NG appear here with their reject comment, so you can track who still has to resubmit their IMDS entry.</p></div>`)
+
+  : (keys.length ? keys.map((key) => {
+      const list = open[key], [code, company] = key.split("|"), f = fuOf(key);
+      const tpl = followUpTemplate(key, list);
+      const email = supplierEmail(code);
+      const id = key.replace(/[^a-z0-9]/gi, "");
+      return `<div class="card w" style="margin-bottom:12px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
+        <div><h3 style="margin:0">${esc(company || "—")}</h3>
+          <div class="small mono">${esc(code)}${email ? " · " + esc(email) : ""}</div>
+          <div class="small">${tpl.parts} part number${tpl.parts === 1 ? "" : "s"} · ${tpl.groups} error group${tpl.groups === 1 ? "" : "s"} · ${list.length} open case${list.length === 1 ? "" : "s"}</div></div>
+        <div style="text-align:right">${pill(key)}
+          ${f.at ? `<div class="small">${esc(f.user || "")} · ${esc(f.at.replace("T", " ").slice(0, 16))}</div>` : ""}
+          ${f.note ? `<div class="small">${esc(f.note)}</div>` : ""}</div>
+      </div>
+      <table style="margin-top:12px"><thead><tr><th>Part number</th><th>Error</th><th>CAS</th><th>What we asked</th></tr></thead><tbody>
+      ${list.slice(0, 8).map((it) => `<tr class="row" data-k="${esc(it.key)}"><td class="mono">${esc(it.record.deliveryPartNo || "—")}</td>
+        <td class="small">${esc(it.evaluation.errorCategory)}</td><td class="mono small">${esc(it.record.cas || "—")}</td>
+        <td class="small">${esc(it.evaluation.pendingQuestion ? it.evaluation.pendingQuestion.question : (flagOf(it) || {}).comment || it.evaluation.reasons[0] || "")}</td></tr>`).join("")}
+      ${list.length > 8 ? `<tr><td colspan="4" class="small">+ ${list.length - 8} more — all of them are in the e-mail</td></tr>` : ""}
+      </tbody></table>
+      <div class="tools" style="margin-top:12px">
+        <button class="btn pri" data-mail="${esc(key)}">✉ Open in Outlook</button>
+        <button class="btn" data-copy="${esc(key)}">Copy e-mail text</button>
+        <button class="btn" data-preview="${esc(key)}">${UI.fuOpen === key ? "Hide" : "Preview"} template</button>
+        ${f.status !== "SENT" ? `<button class="btn" data-sent="${esc(key)}">Mark as followed up</button>` : ""}
+        ${f.status === "SENT" ? `<button class="btn" data-replied="${esc(key)}">Supplier replied</button>` : ""}
+        ${f.status !== "NEED" ? `<button class="btn" data-reset="${esc(key)}">Reset to need follow-up</button>` : ""}
+      </div>
+      ${UI.fuOpen === key ? `<label class="l">Subject</label><input class="btn" style="width:100%" readonly value="${esc(tpl.subject)}">
+        <label class="l">Message</label><textarea readonly style="min-height:320px;font-family:var(--mono);font-size:12px">${esc(tpl.body)}</textarea>` : ""}
+      <div id="mbox-${esc(id)}"></div>
+    </div>`; }).join("")
+    : `<div class="card empty"><div class="big">${ICO.inn}</div><h3>Nothing waiting on a supplier</h3><p>When the engine needs a supplier to confirm something, or you mark a case "Need confirmation to supplier", it appears here with a ready-to-send e-mail.</p></div>`));
+
+  // ---- wiring ----
+  document.querySelectorAll("[data-fu]").forEach((b) => (b.onclick = () => { UI.fuTab = b.dataset.fu; UI.fuOpen = null; render(); }));
   document.querySelectorAll("tr.row").forEach((tr) => (tr.onclick = () => { UI.view = "register"; UI.sel = tr.dataset.k; render(); }));
+  document.querySelectorAll("[data-goreg2]").forEach((b) => (b.onclick = () => { UI.view = "register"; UI.sel = b.dataset.goreg2; render(); }));
+  document.querySelectorAll("[data-preview]").forEach((b) => (b.onclick = () => { UI.fuOpen = UI.fuOpen === b.dataset.preview ? null : b.dataset.preview; render(); }));
+  const mail = (key, tpl) => {
+    const to = supplierEmail(key.split("|")[0]);
+    const href = `mailto:${encodeURIComponent(to)}?subject=${encodeURIComponent(tpl.subject)}&body=${encodeURIComponent(tpl.body)}`;
+    if (href.length > 1900) { navigator.clipboard?.writeText(tpl.body); toast("Too long for a mail link — the text is on your clipboard, paste it into Outlook"); return; }
+    window.location.href = href;
+    toast(to ? `Opening Outlook to ${to}` : "Opening Outlook — add the supplier's address");
+  };
+  document.querySelectorAll("[data-mail]").forEach((b) => (b.onclick = () => {
+    const key = b.dataset.mail; mail(key, followUpTemplate(key, open[key]));
+    if (fuOf(key).status === "NEED") setFollowUp(key, "SENT", "E-mail opened in Outlook");
+  }));
+  document.querySelectorAll("[data-rmail]").forEach((b) => (b.onclick = () => { const key = b.dataset.rmail; mail(key, resubmitTemplate(key, resubBySup[key])); }));
+  const copy = (text, msg) => { navigator.clipboard ? navigator.clipboard.writeText(text).then(() => toast(msg), () => toast("Could not copy — use Preview and select the text")) : toast("Copying is not available in this browser"); };
+  document.querySelectorAll("[data-copy]").forEach((b) => (b.onclick = () => copy(followUpTemplate(b.dataset.copy, open[b.dataset.copy]).body, "Follow-up text copied")));
+  document.querySelectorAll("[data-rcopy]").forEach((b) => (b.onclick = () => copy(resubmitTemplate(b.dataset.rcopy, resubBySup[b.dataset.rcopy]).body, "Resubmission text copied")));
+  document.querySelectorAll("[data-sent]").forEach((b) => (b.onclick = () => { const n = prompt("Note (optional) — how did you follow up?", ""); if (n === null) return; setFollowUp(b.dataset.sent, "SENT", n); }));
+  document.querySelectorAll("[data-replied]").forEach((b) => (b.onclick = () => { const n = prompt("What did the supplier say? (optional)", ""); if (n === null) return; setFollowUp(b.dataset.replied, "REPLIED", n); }));
+  document.querySelectorAll("[data-reset]").forEach((b) => (b.onclick = () => setFollowUp(b.dataset.reset, "NEED", "")));
+  document.querySelectorAll("[data-resub]").forEach((b) => (b.onclick = () => { const n = prompt("Note (optional) — new module ID / version?", ""); if (n === null) return; setResubmit(b.dataset.resub, "RESUBMITTED", n); }));
+  document.querySelectorAll("[data-unresub]").forEach((b) => (b.onclick = () => setResubmit(b.dataset.unresub, null)));
+  const ps = $("#pic-save"); if (ps) ps.onclick = () => { S.settings.picTitle = $("#pic-title").value.trim(); save(); toast("Signature saved"); render(); };
 }
 
 function viewHistory() {
@@ -1966,7 +2194,7 @@ function viewImport() {
   const d = $("#drop"); d.ondragover = (e) => { e.preventDefault(); d.classList.add("over"); }; d.ondragleave = () => d.classList.remove("over");
   d.ondrop = (e) => { e.preventDefault(); d.classList.remove("over"); e.dataTransfer.files[0] && handle(e.dataTransfer.files[0]); };
   $("#sample").onclick = () => { PENDING = { file: "TMMIN_GCATS_Error_Log_July24 (sample)", recs: SAMPLE.records, layout: SAMPLE.layout, cls: "PROTECTED" }; commit(); };
-  $("#clear").onclick = () => { if (!confirmClear()) return; S = { records: [], answers: {}, partAnswers: {}, approvals: {}, audit: [], imports: [], flags: {}, settings: S.settings, selfChecks: [] }; save(); evaluateAll(); render(); };
+  $("#clear").onclick = () => { if (!confirmClear()) return; S = { records: [], answers: {}, partAnswers: {}, approvals: {}, audit: [], imports: [], flags: {}, settings: S.settings, selfChecks: [], followUps: {}, resubmits: {} }; save(); evaluateAll(); render(); };
 }
 function confirmClear() { const b = $("#clear"); if (b.dataset.armed) return true; b.dataset.armed = "1"; b.textContent = "Click again to delete all local data"; return false; }
 
